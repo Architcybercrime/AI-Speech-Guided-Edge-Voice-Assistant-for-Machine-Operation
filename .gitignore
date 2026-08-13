@@ -1,0 +1,7 @@
+﻿data/raw/
+data/augmented/
+__pycache__/
+.venv/
+*.zip
+*.wav
+.DS_Store
