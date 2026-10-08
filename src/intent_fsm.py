@@ -53,7 +53,7 @@ class Tone(Enum):
 @dataclass
 class Config:
     conf_threshold: float = 0.85
-    vote_n: int = 3
+    vote_n: int = 2
     vote_m: int = 5
     cmd_window_ms: int = 3000
     confirm_timeout_ms: int = 3000
