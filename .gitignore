@@ -5,3 +5,8 @@ __pycache__/
 *.zip
 *.wav
 .DS_Store
+
+__pycache__/
+*.pyc
+models/*.keras
+
