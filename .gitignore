@@ -10,3 +10,6 @@ __pycache__/
 *.pyc
 models/*.keras
 
+
+*.bak
+.vscode/
