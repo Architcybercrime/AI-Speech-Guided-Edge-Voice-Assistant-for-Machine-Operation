@@ -1,376 +1,259 @@
 """
-live_demo.py — the full system running on a laptop, no hardware required.
-
-    microphone -> MFCC -> trained model -> safety FSM -> simulated machine
+train_model.py - train the keyword-spotting model on the collected dataset.
 
 Run:
-    python demo/live_demo.py
-    python demo/live_demo.py --threshold 0.70     # looser, for a weak model
-    python demo/live_demo.py --list-devices
-    python demo/live_demo.py --device 2
+    python tools/train_model.py
+    python tools/train_model.py --test-speakers 1
+    python tools/train_model.py --held nalin          # choose the held-out speaker
 
-Keyboard (click the window first):
-    E   toggle the hardwired EMERGENCY STOP
-    G   toggle the guard-door interlock
-    R   manual reset after lockout
-    Q   quit
+Reads  data/augmented/<label>/*.wav   (falls back to data/raw if absent)
+Writes models/kws_model.keras, models/labels.json, models/report.json,
+       models/confusion_matrix.png, models/training_curve.png
 
-This is the same logic that will run on the ESP32-S3. The only difference is
-that the relay, motor, LEDs and OLED are drawn on screen instead of wired.
+Splits
+  test        whole speakers held out (never seen in training). The silence class
+              has no speaker, so 15% of silence clips are held out at random.
+  validation  carved from the training speakers, grouped by source recording so an
+              augmented copy of a clip can never sit in both train and validation.
 """
 
 import argparse
+import glob
 import json
-import math
 import os
-import queue
+import random
+import re
 import sys
-import threading
-import time
-import tkinter as tk
 
 import numpy as np
-import sounddevice as sd
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-ROOT = os.path.dirname(HERE)
-sys.path.insert(0, os.path.join(ROOT, 'src'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
+from features import load_mfcc, INPUT_SHAPE  # noqa: E402
 
-from features import mfcc, SR, CLIP_LEN, INPUT_SHAPE   # noqa: E402
-from intent_fsm import IntentFSM, Config               # noqa: E402
-
-STRIDE_MS = 250
-STRIDE = SR * STRIDE_MS // 1000
-MODEL_PATH = os.path.join(ROOT, 'models', 'kws_model.keras')
-LABELS_PATH = os.path.join(ROOT, 'models', 'labels.json')
-
-BG, PANEL, FG, DIM = '#11181d', '#1b252c', '#eef3f6', '#7d8f9b'
-AMBER, GREEN, RED, BLUE = '#e08900', '#2ecc71', '#e74c3c', '#3498db'
+DATA_AUG = os.path.join('data', 'augmented')
+DATA_RAW = os.path.join('data', 'raw')
+OUT = 'models'
+SILENCE_SPEAKER = 'sil'          # augment.py names generated silence clips sil_0001.wav
 
 
-# ------------------------------------------------------------------ audio
-class Listener(threading.Thread):
-    """Captures audio and emits (label, confidence, latency, level) at a fixed stride."""
-
-    def __init__(self, model, labels, out_q, device=None):
-        super().__init__(daemon=True)
-        self.model, self.labels, self.out_q = model, labels, out_q
-        self.device = device
-        self.ring = np.zeros(CLIP_LEN, np.float32)
-        self.audio_q = queue.Queue()
-        self.running = True
-        self.error = None
-
-    def _cb(self, indata, frames, t, status):
-        self.audio_q.put(indata[:, 0].copy())
-
-    def run(self):
-        try:
-            with sd.InputStream(samplerate=SR, channels=1, dtype='float32',
-                                blocksize=STRIDE, device=self.device,
-                                callback=self._cb):
-                while self.running:
-                    try:
-                        block = self.audio_q.get(timeout=0.5)
-                    except queue.Empty:
-                        continue
-                    n = len(block)
-                    self.ring = np.concatenate([self.ring[n:], block])
-                    level = float(np.max(np.abs(block)))
-                    t0 = time.perf_counter()
-                    feat = mfcc(self.ring)[None, ..., None]
-                    probs = self.model.predict(feat, verbose=0)[0]
-                    ms = (time.perf_counter() - t0) * 1000
-                    i = int(probs.argmax())
-                    self.out_q.put((self.labels[i], float(probs[i]), ms, level))
-        except Exception as e:                      # surfaced in the UI, not swallowed
-            self.error = str(e)
-            self.running = False
+def speaker_of(path):
+    """<speaker>_<nnn>[_augN|_clean].wav -> speaker is the first field."""
+    return os.path.basename(path).split('_')[0]
 
 
-# ------------------------------------------------------------------ ui
-class App:
-    def __init__(self, root, fsm, q, listener):
-        self.fsm, self.q, self.listener = fsm, q, listener
-        self.t0 = time.time()
-        self.latencies = []
-        self.events = []
-        self.level = 0.0
+def base_id(path):
+    """Source recording id: strips the _augN / _clean suffix added by augment.py."""
+    stem = os.path.splitext(os.path.basename(path))[0]
+    return re.sub(r'_(aug\d+|clean)$', '', stem)
 
-        root.title('Edge Voice Assistant - live demo')
-        root.configure(bg=BG)
-        root.geometry('1000x660')
-        self.root = root
 
-        tk.Label(root, text='AI SPEECH-GUIDED EDGE VOICE ASSISTANT', bg=BG, fg=AMBER,
-                 font=('Consolas', 11, 'bold')).pack(pady=(14, 0))
-        tk.Label(root, text='offline  \u00b7  on-device  \u00b7  no network in the signal path',
-                 bg=BG, fg=DIM, font=('Consolas', 9)).pack()
+def collect(root):
+    labels = sorted(d for d in os.listdir(root)
+                    if os.path.isdir(os.path.join(root, d)) and d != '_noise')
+    files, ys, spk = [], [], []
+    for li, lab in enumerate(labels):
+        for f in glob.glob(os.path.join(root, lab, '*.wav')):
+            files.append(f)
+            ys.append(li)
+            spk.append(speaker_of(f))
+    return labels, np.array(files), np.array(ys), np.array(spk)
 
-        body = tk.Frame(root, bg=BG); body.pack(fill='both', expand=True, padx=16, pady=12)
-        left = tk.Frame(body, bg=BG); left.pack(side='left', fill='both', expand=True)
-        right = tk.Frame(body, bg=BG); right.pack(side='right', fill='both', padx=(14, 0))
 
-        # ---- state banner
-        self.state_lbl = tk.Label(left, text='IDLE', bg=PANEL, fg=FG,
-                                  font=('Consolas', 26, 'bold'), pady=14)
-        self.state_lbl.pack(fill='x')
+def make_split(spk, files, test_speakers=1, forced=None, seed=42):
+    """Return (test_mask, held_out_speakers, mode).
 
-        # ---- OLED mock
-        oled = tk.Frame(left, bg='#04131a', highlightbackground='#2b3942',
-                        highlightthickness=1)
-        oled.pack(fill='x', pady=10)
-        tk.Label(oled, text='OLED', bg='#04131a', fg=DIM,
-                 font=('Consolas', 8)).pack(anchor='w', padx=8, pady=(5, 0))
-        self.oled1 = tk.Label(oled, text='Say "Hey Machina"', bg='#04131a', fg='#5df2c8',
-                              font=('Consolas', 15, 'bold'), anchor='w')
-        self.oled1.pack(fill='x', padx=8)
-        self.oled2 = tk.Label(oled, text='', bg='#04131a', fg='#5df2c8',
-                              font=('Consolas', 11), anchor='w')
-        self.oled2.pack(fill='x', padx=8, pady=(0, 8))
+    mode is 'speaker-disjoint' (>=2 real speakers) or 'recording-disjoint' (one speaker:
+    whole source recordings are held out, so no augmented copy leaks into training)."""
+    rng = np.random.RandomState(seed)
+    spk = np.asarray(spk)
+    real = sorted(set(str(s) for s in spk) - {SILENCE_SPEAKER})
+    sil_idx = np.where(spk == SILENCE_SPEAKER)[0]
 
-        # ---- heard
-        hf = tk.Frame(left, bg=PANEL); hf.pack(fill='x', pady=(0, 10))
-        tk.Label(hf, text='HEARD', bg=PANEL, fg=DIM,
-                 font=('Consolas', 8)).pack(anchor='w', padx=10, pady=(6, 0))
-        self.heard = tk.Label(hf, text='\u2014', bg=PANEL, fg=FG,
-                              font=('Consolas', 17, 'bold'), anchor='w')
-        self.heard.pack(fill='x', padx=10)
-        self.conf_c = tk.Canvas(hf, height=12, bg='#243039', highlightthickness=0)
-        self.conf_c.pack(fill='x', padx=10, pady=(4, 4))
-        self.conf_txt = tk.Label(hf, text='confidence 0.00', bg=PANEL, fg=DIM,
-                                 font=('Consolas', 9), anchor='w')
-        self.conf_txt.pack(fill='x', padx=10, pady=(0, 2))
+    held = None
+    if forced:
+        missing = [s for s in forced if s not in real]
+        if missing:
+            sys.exit(f'--held {missing} not found. Speakers in the dataset: {real}')
+        held = set(forced)
+    elif len(real) > test_speakers:
+        held = set(str(s) for s in rng.choice(real, test_speakers, replace=False))
 
-        # ---- mic level meter: tells you instantly if the mic is too quiet
-        tk.Label(hf, text='MIC LEVEL', bg=PANEL, fg=DIM,
-                 font=('Consolas', 8)).pack(anchor='w', padx=10)
-        self.level_c = tk.Canvas(hf, height=8, bg='#243039', highlightthickness=0)
-        self.level_c.pack(fill='x', padx=10, pady=(2, 8))
+    if held is not None:
+        test = np.array([str(s) in held for s in spk])
+        if len(sil_idx):
+            n = max(1, int(0.15 * len(sil_idx)))
+            test[rng.choice(sil_idx, n, replace=False)] = True
+        return test, sorted(held), 'speaker-disjoint'
 
-        # ---- machine outputs
-        mf = tk.Frame(left, bg=PANEL); mf.pack(fill='x')
-        tk.Label(mf, text='MACHINE OUTPUTS', bg=PANEL, fg=DIM,
-                 font=('Consolas', 8)).pack(anchor='w', padx=10, pady=(6, 2))
-        row = tk.Frame(mf, bg=PANEL); row.pack(fill='x', padx=10, pady=(0, 8))
-        self.motor_c = tk.Canvas(row, width=92, height=92, bg=PANEL, highlightthickness=0)
-        self.motor_c.pack(side='left')
-        info = tk.Frame(row, bg=PANEL); info.pack(side='left', padx=14)
-        self.relay_lbl = tk.Label(info, text='RELAY 1   OPEN', bg=PANEL, fg=DIM,
-                                  font=('Consolas', 12, 'bold'), anchor='w')
-        self.relay_lbl.pack(anchor='w')
-        self.speed_lbl = tk.Label(info, text='SPEED  3/5    PWM duty 0', bg=PANEL, fg=FG,
-                                  font=('Consolas', 12), anchor='w')
-        self.speed_lbl.pack(anchor='w', pady=3)
-        self.led_c = tk.Canvas(info, width=200, height=30, bg=PANEL, highlightthickness=0)
-        self.led_c.pack(anchor='w')
-        self.angle = 0.0
+    groups = np.array([base_id(f) for f in files])
+    uniq = np.unique(groups)
+    held_groups = rng.choice(uniq, max(1, len(uniq) // 5), replace=False)
+    return np.isin(groups, held_groups), [], 'recording-disjoint'
 
-        # ---- right column: safety + log
-        sf = tk.Frame(right, bg=PANEL, width=330); sf.pack(fill='x')
-        tk.Label(sf, text='SAFETY INPUTS  (hardwired)', bg=PANEL, fg=DIM,
-                 font=('Consolas', 8)).pack(anchor='w', padx=10, pady=(6, 2))
-        self.estop_lbl = tk.Label(sf, text='[E]  E-STOP      OK', bg=PANEL, fg=GREEN,
-                                  font=('Consolas', 11, 'bold'), anchor='w')
-        self.estop_lbl.pack(fill='x', padx=10)
-        self.guard_lbl = tk.Label(sf, text='[G]  GUARD DOOR  CLOSED', bg=PANEL, fg=GREEN,
-                                  font=('Consolas', 11, 'bold'), anchor='w')
-        self.guard_lbl.pack(fill='x', padx=10, pady=(2, 2))
-        tk.Label(sf, text='[R]  reset      [Q]  quit', bg=PANEL, fg=DIM,
-                 font=('Consolas', 9), anchor='w').pack(fill='x', padx=10, pady=(0, 8))
 
-        lf = tk.Frame(right, bg=PANEL); lf.pack(fill='both', expand=True, pady=(10, 0))
-        tk.Label(lf, text='AUDIT LOG', bg=PANEL, fg=DIM,
-                 font=('Consolas', 8)).pack(anchor='w', padx=10, pady=(6, 2))
-        self.log = tk.Text(lf, bg='#121b21', fg=FG, font=('Consolas', 9), width=42,
-                           height=18, bd=0, highlightthickness=0, wrap='word')
-        self.log.pack(fill='both', expand=True, padx=10, pady=(0, 8))
-        for tag, col in (('accepted', GREEN), ('rejected', RED),
-                         ('prompt', AMBER), ('safety', RED), ('state', DIM)):
-            self.log.tag_config(tag, foreground=col)
+def make_val_split(train_files, seed=42, frac=0.15):
+    """Validation mask over the training files, grouped by source recording."""
+    rng = np.random.RandomState(seed)
+    groups = np.array([base_id(f) for f in train_files])
+    uniq = np.unique(groups)
+    n = max(1, int(frac * len(uniq)))
+    val_groups = rng.choice(uniq, n, replace=False)
+    return np.isin(groups, val_groups)
 
-        self.stats = tk.Label(root, text='', bg=BG, fg=DIM, font=('Consolas', 9))
-        self.stats.pack(pady=(0, 8))
 
-        root.bind('<Key>', self.on_key)
-        root.after(40, self.loop)
+def build_model(n_classes):
+    from tensorflow import keras
+    from tensorflow.keras import layers as L
 
-    # -------------------------------------------------------------- input
-    def now(self):
-        return int((time.time() - self.t0) * 1000)
+    def ds_block(x, filters, stride=1):
+        x = L.SeparableConv2D(filters, 3, strides=stride, padding='same', use_bias=False)(x)
+        x = L.BatchNormalization()(x)
+        return L.ReLU()(x)
 
-    def on_key(self, e):
-        k = e.char.lower()
-        t = self.now()
-        if k == 'e':
-            evs = self.fsm.set_estop(not self.fsm.estop_tripped, t)
-            self.render_events(evs)
-            if not self.fsm.estop_tripped:
-                self.push('E-stop released - press R to reset', 'state')
-        elif k == 'g':
-            self.render_events(self.fsm.set_interlock(not self.fsm.interlock_open, t))
-            if not self.fsm.interlock_open:
-                self.push('Guard door closed', 'state')
-        elif k == 'r':
-            self.render_events(self.fsm.reset(t))
-        elif k == 'q':
-            self.listener.running = False
-            self.root.destroy()
-
-    def push(self, text, tag):
-        self.log.insert('end', f"{time.strftime('%H:%M:%S')}  {text}\n", tag)
-        self.log.see('end')
-
-    def render_events(self, evs):
-        for ev in evs:
-            tag = ev.kind if ev.kind in ('accepted', 'rejected', 'prompt', 'safety') else 'state'
-            txt = ev.message or ev.label
-            if ev.label and ev.kind in ('accepted', 'rejected', 'prompt'):
-                txt = f'{ev.label.upper():<12} {txt}'
-            self.push(txt, tag)
-            if ev.kind in ('accepted', 'prompt'):
-                self.oled1.config(text=(ev.label or '').upper() or 'OK')
-                self.oled2.config(text=ev.message[:34])
-            elif ev.kind == 'rejected':
-                self.oled1.config(text='REJECTED')
-                self.oled2.config(text=ev.message[:34])
-            elif ev.kind == 'safety':
-                self.oled1.config(text=ev.label or 'SAFETY')
-                self.oled2.config(text=ev.message[:34])
-            self.events.append(ev)
-
-    # -------------------------------------------------------------- loop
-    def loop(self):
-        if self.listener.error:
-            self.push(f'AUDIO ERROR: {self.listener.error}', 'safety')
-            self.listener.error = None
-
-        self.render_events(self.fsm.tick(self.now()))
-
-        drained = 0
-        while not self.q.empty() and drained < 6:
-            label, conf, ms, level = self.q.get()
-            self.latencies.append(ms)
-            self.level = level
-            drained += 1
-            self.heard.config(text=label.upper() if conf >= 0.5 else '\u2014')
-            self.draw_conf(conf)
-            self.conf_txt.config(text=f'confidence {conf:.2f}   \u00b7   threshold '
-                                      f'{self.fsm.cfg.conf_threshold:.2f}   \u00b7   '
-                                      f'inference {ms:.0f} ms')
-            self.render_events(self.fsm.feed(label, conf, self.now()))
-
-        self.draw_level()
-        self.render_panel()
-        self.root.after(40, self.loop)
-
-    def draw_conf(self, conf):
-        c = self.conf_c
-        w_total = max(c.winfo_width(), 1)
-        c.delete('all')
-        w = max(1, int(w_total * min(conf, 1.0)))
-        colour = GREEN if conf >= self.fsm.cfg.conf_threshold else DIM
-        c.create_rectangle(0, 0, w, 12, fill=colour, width=0)
-        thr_x = int(w_total * self.fsm.cfg.conf_threshold)
-        c.create_line(thr_x, 0, thr_x, 12, fill=AMBER, width=2)
-
-    def draw_level(self):
-        c = self.level_c
-        w_total = max(c.winfo_width(), 1)
-        c.delete('all')
-        # 0.25 full scale: anything under ~0.05 is too quiet to classify reliably
-        frac = min(self.level / 0.25, 1.0)
-        colour = RED if self.level < 0.03 else (AMBER if self.level < 0.08 else GREEN)
-        c.create_rectangle(0, 0, max(1, int(w_total * frac)), 8, fill=colour, width=0)
-
-    def render_panel(self):
-        s = self.fsm.status()
-        colours = {'IDLE': DIM, 'LISTENING': BLUE, 'AWAIT_CONFIRM': AMBER,
-                   'COOLDOWN': AMBER, 'LOCKOUT': RED}
-        self.state_lbl.config(text=s['state'], fg=colours.get(s['state'], FG))
-
-        if s['state'] == 'IDLE' and not s['motor_on']:
-            self.oled1.config(text='Say "Hey Machina"')
-
-        self.relay_lbl.config(text=f"RELAY 1   {'CLOSED' if s['relay_enable'] else 'OPEN'}",
-                              fg=GREEN if s['relay_enable'] else DIM)
-        self.speed_lbl.config(text=f"SPEED  {s['speed']}/5    PWM duty {s['duty']}")
-
-        c = self.motor_c
-        c.delete('all')
-        c.create_oval(6, 6, 86, 86, outline='#39474f', width=2)
-        if s['motor_on']:
-            self.angle += 0.08 * s['speed']
-        for k in range(3):
-            a = self.angle + k * 2 * math.pi / 3
-            c.create_line(46, 46, 46 + 34 * math.cos(a), 46 + 34 * math.sin(a),
-                          fill=GREEN if s['motor_on'] else '#39474f', width=4)
-        c.create_oval(40, 40, 52, 52, fill=GREEN if s['motor_on'] else '#39474f', width=0)
-
-        lc = self.led_c
-        lc.delete('all')
-        st = s['state']
-        leds = [(GREEN, st == 'IDLE' and not s['estop']),
-                (BLUE, st in ('LISTENING', 'AWAIT_CONFIRM')),
-                (RED, st == 'LOCKOUT' or s['estop'])]
-        for i, (col, on) in enumerate(leds):
-            x = 8 + i * 34
-            lc.create_oval(x, 6, x + 20, 26, fill=col if on else '#243039', width=0)
-
-        self.estop_lbl.config(text=f"[E]  E-STOP      {'TRIPPED' if s['estop'] else 'OK'}",
-                              fg=RED if s['estop'] else GREEN)
-        self.guard_lbl.config(
-            text=f"[G]  GUARD DOOR  {'OPEN' if s['interlock_open'] else 'CLOSED'}",
-            fg=RED if s['interlock_open'] else GREEN)
-
-        if self.latencies:
-            arr = np.array(self.latencies[-200:])
-            acc = sum(1 for e in self.events if e.kind == 'accepted')
-            rej = sum(1 for e in self.events if e.kind == 'rejected')
-            self.stats.config(text=f'inference p95 {np.percentile(arr, 95):.0f} ms   \u00b7   '
-                                   f'windows {len(self.latencies)}   \u00b7   '
-                                   f'accepted {acc}   \u00b7   rejected {rej}   \u00b7   '
-                                   f'uptime {int(time.time()-self.t0)} s')
+    inp = keras.Input(shape=INPUT_SHAPE)
+    x = L.Conv2D(32, 3, strides=2, padding='same', use_bias=False)(inp)
+    x = L.BatchNormalization()(x)
+    x = L.ReLU()(x)
+    x = ds_block(x, 48)
+    x = ds_block(x, 64, stride=2)
+    x = ds_block(x, 64)
+    x = ds_block(x, 96, stride=2)
+    x = L.GlobalAveragePooling2D()(x)
+    x = L.Dropout(0.3)(x)
+    out = L.Dense(n_classes, activation='softmax')(x)
+    return keras.Model(inp, out, name='kws_dscnn')
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--threshold', type=float, default=0.85,
-                    help='confidence threshold; lower it if the model is under-trained')
-    ap.add_argument('--device', type=int, default=None, help='input device index')
-    ap.add_argument('--list-devices', action='store_true')
+    ap.add_argument('--epochs', type=int, default=50)
+    ap.add_argument('--batch', type=int, default=32)
+    ap.add_argument('--test-speakers', type=int, default=1)
+    ap.add_argument('--held', nargs='+', help='speaker name(s) to hold out, e.g. --held nalin')
+    ap.add_argument('--seed', type=int, default=42)
     args = ap.parse_args()
+    random.seed(args.seed)
+    np.random.seed(args.seed)
 
-    if args.list_devices:
-        print(sd.query_devices())
-        return
+    root = DATA_AUG if os.path.isdir(DATA_AUG) and os.listdir(DATA_AUG) else DATA_RAW
+    if not os.path.isdir(root):
+        sys.exit('No dataset found. Run tools/record_dataset.py first.')
+    print(f'dataset: {root}')
 
-    if not os.path.exists(MODEL_PATH):
-        sys.exit(f'Model not found at {MODEL_PATH}\nRun: python tools/train_model.py')
+    labels, files, y, spk = collect(root)
+    if not len(files):
+        sys.exit('No wav files found.')
+    real_speakers = sorted(set(str(s) for s in spk) - {SILENCE_SPEAKER})
+    print(f'{len(files)} clips | {len(labels)} classes | real speakers: {real_speakers}')
+    for li, lab in enumerate(labels):
+        print(f'   {lab:<14} {int((y == li).sum())}')
 
-    labels = json.load(open(LABELS_PATH))
-    print('loading model...')
+    # ---------------- split
+    test_mask, held, mode = make_split(spk, files, args.test_speakers, args.held, args.seed)
+    if mode == 'speaker-disjoint':
+        print(f'\nSPLIT: speaker-disjoint. Held-out test speaker(s): {held}')
+    else:
+        print('\nSPLIT: recording-disjoint. Only one real speaker, so the test clips are unseen '
+              'RECORDINGS of the SAME voice. This is NOT accuracy on a new speaker.')
+
+    # ---------------- features
+    print('\nextracting MFCC features...')
+    X = np.stack([load_mfcc(f) for f in files])[..., None]
+    print(f'feature tensor: {X.shape}')
+
+    train_files = files[~test_mask]
+    Xtr, ytr = X[~test_mask], y[~test_mask]
+    Xte, yte = X[test_mask], y[test_mask]
+    val_mask = make_val_split(train_files, args.seed)
+    Xval, yval = Xtr[val_mask], ytr[val_mask]
+    Xfit, yfit = Xtr[~val_mask], ytr[~val_mask]
+    print(f'train {len(Xfit)} | val {len(Xval)} | test {len(Xte)}')
+    if not len(Xte):
+        sys.exit('Test set is empty.')
+
+    # ---------------- train
     from tensorflow import keras
-    model = keras.models.load_model(MODEL_PATH)
-    # Keras 3 does not reliably expose model.input_shape, so use the known
-    # feature shape from features.py instead.
-    model.predict(np.zeros((1,) + INPUT_SHAPE, np.float32), verbose=0)
-    print(f'ready - threshold {args.threshold:.2f}, {len(labels)} classes')
+    model = build_model(len(labels))
+    model.compile(optimizer=keras.optimizers.Adam(1e-3),
+                  loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+    model.summary()
 
-    q = queue.Queue()
-    fsm = IntentFSM(cfg=Config(conf_threshold=args.threshold))
-    listener = Listener(model, labels, q, device=args.device)
-    listener.start()
+    os.makedirs(OUT, exist_ok=True)
+    cbs = [
+        keras.callbacks.EarlyStopping(monitor='val_accuracy', patience=12,
+                                      restore_best_weights=True),
+        keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5, min_lr=1e-5),
+    ]
+    hist = model.fit(Xfit, yfit, validation_data=(Xval, yval),
+                     epochs=args.epochs, batch_size=args.batch, callbacks=cbs, verbose=2)
 
-    root = tk.Tk()
-    App(root, fsm, q, listener)
-    root.mainloop()
-    listener.running = False
+    # ---------------- evaluate
+    probs = model.predict(Xte, verbose=0)
+    pred = probs.argmax(1)
+    acc = float((pred == yte).mean())
+    tag = 'HELD-OUT-SPEAKER' if mode == 'speaker-disjoint' else 'UNSEEN-RECORDINGS, SAME SPEAKER'
+    print(f'\n{tag} TEST ACCURACY: {acc * 100:.2f}%')
 
-    out = os.path.join(ROOT, 'models', 'demo_audit_log.json')
-    os.makedirs(os.path.dirname(out), exist_ok=True)
-    json.dump(fsm.log, open(out, 'w'), indent=2)
-    print(f'audit log -> {out}  ({len(fsm.log)} events)')
+    cm = np.zeros((len(labels), len(labels)), int)
+    for t, p in zip(yte, pred):
+        cm[t, p] += 1
+
+    per_class = {}
+    print('\nper-class recall')
+    for i, lab in enumerate(labels):
+        tot = int(cm[i].sum())
+        rec = round(float(cm[i, i] / tot), 4) if tot else None
+        per_class[lab] = {'support': tot, 'recall': rec}
+        print(f'   {lab:<14} {tot:>4} clips   recall {rec if rec is None else f"{rec * 100:.0f}%"}')
+
+    model.save(os.path.join(OUT, 'kws_model.keras'))
+    json.dump(labels, open(os.path.join(OUT, 'labels.json'), 'w'), indent=2)
+    json.dump({'test_accuracy': acc, 'split_mode': mode, 'held_out': held,
+               'train_speakers': [s for s in real_speakers if s not in held],
+               'n_clips': int(len(files)), 'n_test_clips': int(len(Xte)),
+               'speakers': real_speakers, 'per_class': per_class,
+               'confusion_matrix': cm.tolist(), 'labels': labels},
+              open(os.path.join(OUT, 'report.json'), 'w'), indent=2)
+
+    # ---------------- plots
+    try:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+
+        fig, ax = plt.subplots(figsize=(7.5, 6.5))
+        norm = cm / np.maximum(cm.sum(1, keepdims=True), 1)
+        ax.imshow(norm, cmap='Blues', vmin=0, vmax=1)
+        ax.set_xticks(range(len(labels)), labels, rotation=45, ha='right')
+        ax.set_yticks(range(len(labels)), labels)
+        for i in range(len(labels)):
+            for j in range(len(labels)):
+                if cm[i, j]:
+                    ax.text(j, i, cm[i, j], ha='center', va='center',
+                            color='white' if norm[i, j] > 0.5 else 'black', fontsize=8)
+        ax.set_xlabel('predicted')
+        ax.set_ylabel('actual')
+        who = ', '.join(held) if held else 'unseen recordings, same speaker'
+        ax.set_title(f'Confusion matrix - held out: {who} ({acc * 100:.1f}%)')
+        fig.tight_layout()
+        fig.savefig(os.path.join(OUT, 'confusion_matrix.png'), dpi=140)
+
+        fig, ax = plt.subplots(figsize=(7, 4))
+        ax.plot(hist.history['accuracy'], label='train')
+        ax.plot(hist.history['val_accuracy'], label='validation')
+        ax.set_xlabel('epoch')
+        ax.set_ylabel('accuracy')
+        ax.legend()
+        ax.grid(alpha=.3)
+        ax.set_title('Training curve')
+        fig.tight_layout()
+        fig.savefig(os.path.join(OUT, 'training_curve.png'), dpi=140)
+        print('saved confusion_matrix.png and training_curve.png')
+    except Exception as e:
+        print('plotting skipped:', e)
+
+    print(f'\nmodel -> {OUT}/kws_model.keras')
+    print('next:  python tools/evaluate.py   then   python demo/live_demo.py')
 
 
 if __name__ == '__main__':
